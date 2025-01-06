@@ -22,7 +22,8 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.2.2"
+
+#define ADIOS_VERSION "0.3.0"
 
 static u64 global_latency_window = 20000000ULL;
 static int bq_refill_below_ratio = 15;
@@ -113,9 +114,11 @@ struct io_stats {
 	uint32_t merged;
 	uint32_t dispatched;
 	atomic_t completed;
+
+	uint32_t max_batch_count[ADIOS_NUM_OPTYPES];
 };
 
-#define NUM_BQ_PAGES 2
+#define ADIOS_NUM_BQ_PAGES 2
 
 /*
  * Adios scheduler data. Requests are present on both sort_list and dispatch list.
@@ -135,8 +138,8 @@ struct ad_data {
 
 	int bq_page;
 	bool more_bq_ready;
-	struct list_head batch_queue[NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
-	unsigned int batch_count[NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
+	struct list_head batch_queue[ADIOS_NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
+	unsigned int batch_count[ADIOS_NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
 	u64 total_predicted_latency;
 };
 
@@ -296,19 +299,26 @@ adios_next_request(struct ad_data *ad) {
 	return rb_entry_rq(rb_first(&ad->sort_list));
 }
 
+static void adios_reset_batch_queues(struct ad_data *ad, int page) {
+	memset(&ad->batch_count[page], 0, sizeof(ad->batch_count[page]));
+}
+
 static void adios_init_batch_queues(struct ad_data *ad) {
-	for (int page = 0; page < NUM_BQ_PAGES; page++) {
-		for (int optype = 0; optype < ADIOS_NUM_OPTYPES; optype++) {
+	for (int page = 0; page < ADIOS_NUM_BQ_PAGES; page++) {
+		adios_reset_batch_queues(ad, page);
+
+		for (int optype = 0; optype < ADIOS_NUM_OPTYPES; optype++)
 			INIT_LIST_HEAD(&ad->batch_queue[page][optype]);
-			ad->batch_count[page][optype] = 0;
-		}
-		ad->total_predicted_latency = 0;
 	}
 }
 
 static bool adios_fill_batch_queues(struct ad_data *ad) {
 	unsigned int count = 0;
-	int page = (ad->bq_page + 1) % NUM_BQ_PAGES;
+	unsigned int optype_count[ADIOS_NUM_OPTYPES];
+	memset(optype_count, 0, sizeof(optype_count));
+	int page = (ad->bq_page + 1) % ADIOS_NUM_BQ_PAGES;
+
+	adios_reset_batch_queues(ad, page);
 
 	while (true) {
 		struct request *rq = adios_next_request(ad);
@@ -332,10 +342,16 @@ static bool adios_fill_batch_queues(struct ad_data *ad) {
 		list_add_tail(&rq->queuelist, &ad->batch_queue[page][optype]);
 		ad->batch_count[page][optype]++;
 		ad->total_predicted_latency = lat;
+		optype_count[optype]++;
 		count++;
 	}
-	if (count)
+	if (count) {
 		ad->more_bq_ready = true;
+		for (int optype = 0; optype < ADIOS_NUM_OPTYPES; optype++) {
+			if (ad->stats.max_batch_count[optype] < optype_count[optype])
+				ad->stats.max_batch_count[optype] = optype_count[optype];
+		}
+	}
 	return count;
 }
 
@@ -661,7 +677,7 @@ static void ad_finish_request(struct request *rq) {
 }
 
 static bool ad_has_work_for_ad(struct ad_data *ad) {
-	for (int page = 0; page < NUM_BQ_PAGES; page++)
+	for (int page = 0; page < ADIOS_NUM_BQ_PAGES; page++)
 		for (int i = 0; i < ADIOS_NUM_OPTYPES; i++)
 			if(!list_empty_careful(&ad->batch_queue[page][i]))
 				return true;
@@ -732,6 +748,62 @@ SYSFS_OPTYPE_DECL(write, ADIOS_WRITE);
 SYSFS_OPTYPE_DECL(discard, ADIOS_DISCARD);
 SYSFS_OPTYPE_DECL(other, ADIOS_OTHER);
 
+static ssize_t adios_max_batch_count_show(struct elevator_queue *e, char *page) {
+	struct ad_data *ad = e->elevator_data;
+	unsigned int read_count, write_count, discard_count, other_count;
+
+	guard(spinlock)(&ad->lock);
+	read_count = ad->stats.max_batch_count[ADIOS_READ];
+	write_count = ad->stats.max_batch_count[ADIOS_WRITE];
+	discard_count = ad->stats.max_batch_count[ADIOS_DISCARD];
+	other_count = ad->stats.max_batch_count[ADIOS_OTHER];
+
+	return sprintf(page,
+		"Read: %u\nWrite: %u\nDiscard: %u\nOther: %u\n",
+		read_count, write_count, discard_count, other_count);
+}
+
+static ssize_t adios_reset_bq_stats_store(struct elevator_queue *e, const char *page, size_t count) {
+	struct ad_data *ad = e->elevator_data;
+	unsigned long val;
+	int ret;
+
+	ret = kstrtoul(page, 10, &val);
+	if (ret || val != 1)
+		return -EINVAL;
+
+	guard(spinlock)(&ad->lock);
+	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++)
+		ad->stats.max_batch_count[i] = 0;
+
+	return count;
+}
+
+static ssize_t adios_reset_latency_model_store(struct elevator_queue *e, const char *page, size_t count) {
+	struct ad_data *ad = e->elevator_data;
+	unsigned long val;
+	int ret;
+
+	ret = kstrtoul(page, 10, &val);
+	if (ret || val != 1)
+		return -EINVAL;
+
+	guard(spinlock)(&ad->lock);
+	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++) {
+		struct latency_model *model = &ad->latency_model[i];
+		spin_lock(&model->lock);
+		model->intercept = 0ULL;
+		model->slope = 0ULL;
+		model->small_sum_delay = 0ULL;
+		model->small_count = 0ULL;
+		model->large_sum_delay = 0ULL;
+		model->large_sum_block_size = 0ULL;
+		spin_unlock(&model->lock);
+	}
+
+	return count;
+}
+
 static ssize_t adios_global_latency_window_store(struct elevator_queue *e, const char *page, size_t count)
 {
 	unsigned long nsec;
@@ -774,7 +846,7 @@ static ssize_t adios_bq_refill_below_ratio_store(
 
 static ssize_t adios_version_show(struct elevator_queue *e, char *page)
 {
-    return sprintf(page, "%s\n", ADIOS_VERSION);
+	return sprintf(page, "%s\n", ADIOS_VERSION);
 }
 
 static struct elv_fs_entry adios_sched_attrs[] = {
@@ -792,6 +864,10 @@ static struct elv_fs_entry adios_sched_attrs[] = {
 	DD_ATTR(max_batch_size_write, adios_write_max_batch_size_show, adios_write_max_batch_size_store),
 	DD_ATTR(max_batch_size_discard, adios_discard_max_batch_size_show, adios_discard_max_batch_size_store),
 	DD_ATTR(max_batch_size_other, adios_other_max_batch_size_show, adios_other_max_batch_size_store),
+
+    DD_ATTR(max_batch_count, adios_max_batch_count_show, NULL),
+    DD_ATTR(reset_bq_stats, NULL, adios_reset_bq_stats_store),
+    DD_ATTR(reset_latency_model, NULL, adios_reset_latency_model_store),
 
 	DD_ATTR(global_latency_window, adios_global_latency_window_show, adios_global_latency_window_store),
 	DD_ATTR(bq_refill_below_ratio, adios_bq_refill_below_ratio_show, adios_bq_refill_below_ratio_store),
