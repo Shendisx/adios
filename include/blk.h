@@ -35,6 +35,7 @@ struct blk_flush_queue *blk_alloc_flush_queue(int node, int cmd_size,
 					      gfp_t flags);
 void blk_free_flush_queue(struct blk_flush_queue *q);
 
+void blk_freeze_queue(struct request_queue *q);
 bool __blk_mq_unfreeze_queue(struct request_queue *q, bool force_atomic);
 bool blk_queue_start_drain(struct request_queue *q);
 bool __blk_freeze_queue_start(struct request_queue *q,
@@ -410,6 +411,17 @@ void blk_apply_bdi_limits(struct backing_dev_info *bdi,
 		struct queue_limits *lim);
 int blk_dev_init(void);
 
+/*
+ * Contribute to IO statistics IFF:
+ *
+ *	a) it's attached to a gendisk, and
+ *	b) the queue had IO stats enabled when this request was started
+ */
+static inline bool blk_do_io_stat(struct request *rq)
+{
+	return (rq->rq_flags & RQF_IO_STAT) && !blk_rq_is_passthrough(rq);
+}
+
 void update_io_ticks(struct block_device *part, unsigned long now, bool end);
 unsigned int part_in_flight(struct block_device *part);
 
@@ -456,6 +468,11 @@ void disk_free_zone_resources(struct gendisk *disk);
 static inline bool bio_zone_write_plugging(struct bio *bio)
 {
 	return bio_flagged(bio, BIO_ZONE_WRITE_PLUGGING);
+}
+static inline bool bio_is_zone_append(struct bio *bio)
+{
+	return bio_op(bio) == REQ_OP_ZONE_APPEND ||
+		bio_flagged(bio, BIO_EMULATES_ZONE_APPEND);
 }
 void blk_zone_write_plug_bio_merged(struct bio *bio);
 void blk_zone_write_plug_init_request(struct request *rq);
@@ -505,6 +522,10 @@ static inline bool bio_zone_write_plugging(struct bio *bio)
 {
 	return false;
 }
+static inline bool bio_is_zone_append(struct bio *bio)
+{
+	return false;
+}
 static inline void blk_zone_write_plug_bio_merged(struct bio *bio)
 {
 }
@@ -543,7 +564,6 @@ void blk_free_ext_minor(unsigned int minor);
 #define ADDPART_FLAG_NONE	0
 #define ADDPART_FLAG_RAID	1
 #define ADDPART_FLAG_WHOLEDISK	2
-#define ADDPART_FLAG_READONLY	4
 int bdev_add_partition(struct gendisk *disk, int partno, sector_t start,
 		sector_t length);
 int bdev_del_partition(struct gendisk *disk, int partno);
