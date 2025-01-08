@@ -22,7 +22,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.5.0"
+#define ADIOS_VERSION "0.5.2"
 
 static u64 global_latency_window = 16000000ULL;
 static int bq_refill_below_ratio = 15;
@@ -158,6 +158,8 @@ struct ad_data {
 };
 
 struct ad_rq_data {
+	struct request *rq;
+
 	u64 deadline;
 	u64 predicted_latency;
 	u64 block_size;
@@ -175,10 +177,8 @@ adios_add_rq_rb_sort_list(struct ad_data *ad, struct request *rq) {
 	struct rb_node **new = &(root->rb_node), *parent = NULL;
 	struct ad_rq_data *rd = rq_data(rq);
 
-	if (!rd) {
-		pr_err("adios_add_rq_rb_sort_list: rd is NULL\n");
+	if (WARN(!rd,"adios_add_rq_rb_sort_list: rd is NULL\n"))
 		return;
-	}
 
 	rd->block_size = blk_rq_bytes(rq);
 	unsigned int optype = adios_optype(rq);
@@ -191,10 +191,8 @@ adios_add_rq_rb_sort_list(struct ad_data *ad, struct request *rq) {
 		struct request *this = rb_entry_rq(*new);
 		struct ad_rq_data *td = rq_data(this);
 
-		if (!td) {
-			pr_err("adios_add_rq_rb_sort_list: td is NULL\n");
+		if (WARN(!td,"adios_add_rq_rb_sort_list: td is NULL\n"))
 			return;
-		}
 
 		s64 diff = td->deadline - rd->deadline;
 
@@ -212,15 +210,24 @@ adios_add_rq_rb_sort_list(struct ad_data *ad, struct request *rq) {
 static void
 adios_add_rq_rb_pos_list(struct ad_data *ad, struct request *rq) {
 	struct ad_rq_data *rd = rq_data(rq);
+
+	if (WARN(!rd,"adios_add_rq_rb_pos_list: rd is NULL\n"))
+		return;
+
 	sector_t pos = blk_rq_pos(rq);
 	struct rb_root *root = &ad->pos_list;
 	struct rb_node **new = &(root->rb_node), *parent = NULL;
 
 	while (*new) {
-		struct request *this = rb_entry_rq(*new);
+		struct ad_rq_data *td = rb_entry(*new, struct ad_rq_data, pos_node);
+
+		if (WARN(!td,"adios_add_rq_rb_pos_list: td is NULL\n"))
+			return;
+
+		struct request *trq = td->rq;
 
 		parent = *new;
-		if (blk_rq_pos(this) >= pos)
+		if (blk_rq_pos(trq) >= pos)
 			new = &((*new)->rb_left);
 		else
 			new = &((*new)->rb_right);
@@ -356,9 +363,9 @@ static bool adios_fill_batch_queues(struct ad_data *ad, u64 *tpl) {
 		lat += rd->predicted_latency;
 
 		// Check batch size and total predicted latency
-		if (count && (ad->batch_count[page][optype] >=
-				adios_max_batch_size[optype] ||
-			lat > global_latency_window)) {
+		if (count && (!ad->latency_model[optype].intercept ||
+			(ad->batch_count[page][optype] >= adios_max_batch_size[optype] ||
+			lat > global_latency_window))) {
 			break;
 		}
 
@@ -704,12 +711,11 @@ static void ad_prepare_request(struct request *rq) {
 	rq->elv.priv[1] = NULL;
 
 	/* Allocate ad_rq_data from the memory pool */
-	rd = kmem_cache_alloc(ad->ad_rq_data_pool, GFP_ATOMIC);
-	if (!rd) {
-		pr_err("ad_prepare_request: Failed to allocate memory from ad_rq_data_pool. rd is NULL\n");
+	rd = kmem_cache_zalloc(ad->ad_rq_data_pool, GFP_ATOMIC);
+	if (WARN(!rd, "ad_prepare_request: Failed to allocate memory from ad_rq_data_pool. rd is NULL\n"))
 		return;
-	}
 
+	rd->rq = rq;
 	rq->elv.priv[1] = rd;
 }
 
@@ -941,9 +947,9 @@ static struct elv_fs_entry adios_sched_attrs[] = {
 	DD_ATTR(max_batch_size_discard, adios_discard_max_batch_size_show, adios_discard_max_batch_size_store),
 	DD_ATTR(max_batch_size_other, adios_other_max_batch_size_show, adios_other_max_batch_size_store),
 
-    DD_ATTR(max_batch_count, adios_max_batch_count_show, NULL),
-    DD_ATTR(reset_bq_stats, NULL, adios_reset_bq_stats_store),
-    DD_ATTR(reset_latency_model, NULL, adios_reset_latency_model_store),
+	DD_ATTR(max_batch_count, adios_max_batch_count_show, NULL),
+	DD_ATTR(reset_bq_stats, NULL, adios_reset_bq_stats_store),
+	DD_ATTR(reset_latency_model, NULL, adios_reset_latency_model_store),
 
 	DD_ATTR(global_latency_window, adios_global_latency_window_show, adios_global_latency_window_store),
 	DD_ATTR(bq_refill_below_ratio, adios_bq_refill_below_ratio_show, adios_bq_refill_below_ratio_store),
