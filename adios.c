@@ -19,10 +19,10 @@
 #include <linux/sbitmap.h>
 #include <linux/timekeeping.h>
 
-#include "elevator.h"
-#include "blk.h"
-#include "blk-mq.h"
-#include "blk-mq-sched.h"
+#include "include/elevator.h"
+#include "include/blk.h"
+#include "include/blk-mq.h"
+#include "include/blk-mq-sched.h"
 
 #define ADIOS_VERSION "0.7.1"
 
