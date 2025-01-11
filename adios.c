@@ -10,6 +10,7 @@
 #include <linux/fs.h>
 #include <linux/blkdev.h>
 #include <linux/bio.h>
+#include <linux/math.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/init.h>
@@ -18,12 +19,12 @@
 #include <linux/sbitmap.h>
 #include <linux/timekeeping.h>
 
-#include "include/elevator.h"
-#include "include/blk.h"
-#include "include/blk-mq.h"
-#include "include/blk-mq-sched.h"
+#include "elevator.h"
+#include "blk.h"
+#include "blk-mq.h"
+#include "blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.7.0"
+#define ADIOS_VERSION "0.7.1"
 
 static u64 global_latency_window = 16000000ULL;
 static int bq_refill_below_ratio = 15;
@@ -101,7 +102,7 @@ static unsigned int latency_model_input_bucket_index(
 		bucket_index = (measured * 10) / predicted + 20;
 	else
 		bucket_index = (measured * 3) / predicted + 40;
-
+	
 	return bucket_index;
 }
 
@@ -118,7 +119,7 @@ static bool latency_model_update_small_buckets(
 	u32 threshold_count = 0;
 	u32 cumulative_count = 0;
 	u32 outlier_threshold_bucket = 0;
-	u64 sum_latency = 0, sum_bucket_count = 0;
+	u64 sum_latency = 0, sum_count = 0;
 	u32 outlier_percentile = LM_OUTLIER_PERCENTILE;
 
 	if (count_all)
@@ -141,8 +142,7 @@ static bool latency_model_update_small_buckets(
 		struct latency_bucket *bucket = &model->small_bucket[i];
 		if (i < outlier_threshold_bucket) {
 			sum_latency += bucket->sum_latency;
-			sum_bucket_count += bucket->count;
-			model->small_count += bucket->count;
+			sum_count += bucket->count;
 		} else {
 			// For the threshold bucket, calculate the contribution proportionally
 			u64 remaining_count =
@@ -151,13 +151,13 @@ static bool latency_model_update_small_buckets(
 				sum_latency +=
 					(bucket->sum_latency * remaining_count) / bucket->count;
 			}
-			sum_bucket_count += remaining_count;
+			sum_count += remaining_count;
 		}
 	}
 
 	// Accumulate the average latency into the statistics
 	model->small_sum_delay += sum_latency;
-	model->small_count += sum_bucket_count;
+	model->small_count += sum_count;
 
 	// Reset small bucket information
 	memset(model->small_bucket, 0, sizeof(model->small_bucket[0]) * LM_NUM_BUCKETS);
@@ -178,8 +178,8 @@ static bool latency_model_update_large_buckets(
 	unsigned int threshold_count = 0;
 	unsigned int cumulative_count = 0;
 	unsigned int outlier_threshold_bucket = 0;
-	u64 sum_latency = 0;
-	u64 sum_block_size = 0;
+	s64 sum_latency = 0;
+	u64 sum_block_size = 0, intercept;
 	u32 outlier_percentile = LM_OUTLIER_PERCENTILE;
 
 	if (count_all)
@@ -216,7 +216,9 @@ static bool latency_model_update_large_buckets(
 	}
 
 	// Accumulate the average delay into the statistics
-	model->large_sum_delay += sum_latency;
+	intercept = model->base * threshold_count;
+	if (sum_latency > intercept)
+		model->large_sum_delay += sum_latency - intercept;
 	model->large_sum_block_size += sum_block_size;
 
 	// Reset large bucket information
@@ -240,7 +242,7 @@ static void latency_model_update(struct latency_model *model) {
 	now = jiffies;
 	time_elapsed = unlikely(!model->base) || model->last_updated_jiffies +
 		msecs_to_jiffies(LM_INTERVAL_THRESHOLD) <= now;
-
+	
 	small_count = latency_model_count_small_buckets(model);
 	large_count = latency_model_count_large_buckets(model);
 
@@ -263,7 +265,8 @@ static void latency_model_update(struct latency_model *model) {
 
 	// Update the slope parameter if large bucket was processed
 	if (large_processed && model->large_sum_block_size)
-		model->slope = div_u64(model->large_sum_delay, model->large_sum_block_size);
+		model->slope = div_u64(model->large_sum_delay,
+			DIV_ROUND_UP_ULL(model->large_sum_block_size, 1024));
 
 	// Reset statistics and update last updated jiffies if time has elapsed
 	if (time_elapsed)
@@ -311,7 +314,7 @@ static void latency_model_input(struct latency_model *model,
 
 		model->large_bucket[bucket_index].count++;
 		model->large_bucket[bucket_index].sum_latency += latency;
-		model->large_bucket[bucket_index].sum_block_size += block_size / 1024;
+		model->large_bucket[bucket_index].sum_block_size += block_size;
 	}
 
 	spin_unlock_irqrestore(&model->buckets_lock, flags);
@@ -374,7 +377,7 @@ struct adios_data {
 
 struct adios_rq_data {
 	struct request *rq;
-
+	
 	u64 deadline;
 	u64 predicted_latency;
 	u64 block_size;
@@ -523,7 +526,7 @@ static bool adios_fill_batch_queues(struct adios_data *ad, u64 *tpl) {
 		lat += rd->predicted_latency;
 
 		// Check batch size and total predicted latency
-		if (count && (!ad->latency_model[optype].base ||
+		if (count && (!ad->latency_model[optype].base || 
 			ad->batch_count[page][optype] >= adios_batch_size_limit[optype] ||
 			lat > global_latency_window)) {
 			break;
@@ -933,7 +936,7 @@ static ssize_t adios_lat_model_##name##_show(struct elevator_queue *e, char *pag
 	len += sprintf(page + len, "slope: %llu ns / kB\n", model->slope);	\
 	len += sprintf(page + len, "small: %llu ns / %llu rq\n", \
 		model->small_sum_delay, model->small_count);\
-	len += sprintf(page + len, "large: %llu ns / %llu kB\n", \
+	len += sprintf(page + len, "large: %llu ns / %llu B\n", \
 		model->large_sum_delay, model->large_sum_block_size);\
 	spin_unlock_irqrestore(&model->lock, flags); \
 	return len;							\
