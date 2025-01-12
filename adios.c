@@ -24,7 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.7.6"
+#define ADIOS_VERSION "0.7.7"
 
 static u64 global_latency_window = 16000000ULL;
 static int bq_refill_below_ratio = 15;
@@ -70,9 +70,9 @@ static unsigned int adios_batch_size_limit[ADIOS_NUM_OPTYPES] = {
 #define LM_INTERVAL_THRESHOLD   1500
 #define LM_OUTLIER_PERCENTILE     99
 #define LM_NUM_BUCKETS            64
-#define LM_ADJ_TOLERANCE_BASE      2
-#define LM_ADJ_TOLERANCE_SLOPE     1
-#define LM_ADJ_REDUCTION_RESIST    6
+#define LM_SHRINK_AT_MREQ         10
+#define LM_SHRINK_AT_GBYTES      100
+#define LM_SHRINK_RESIST           2
 
 struct latency_bucket {
 	u64 count;
@@ -94,26 +94,6 @@ struct latency_model {
 	struct latency_bucket large_bucket[LM_NUM_BUCKETS];
 	spinlock_t buckets_lock;
 };
-
-static u64 deviation_bits(u64 a, u64 b, unsigned int threshold) {
-	u64 deviation;
-	unsigned int dbits;
-	
-	if (a > b) swap(a, b);
-	if (a << threshold < b)
-		return 0;
-
-	if (a)
-		deviation = div_u64(b, a);
-	if (deviation <= 1)
-		return 0;
-
-	dbits = fls64(deviation);
-	if (dbits > threshold)
-		dbits -= threshold;
-
-	return dbits;
-}
 
 static inline u64 calculate_base(u64 sum_delay, u64 count) {
 	return !count ? 0 : div_u64(sum_delay, count);
@@ -139,8 +119,7 @@ static bool latency_model_update_small_buckets(
 	u32 outlier_threshold_bucket = 0;
 	u64 sum_latency = 0, sum_count = 0;
 	u32 outlier_percentile = LM_OUTLIER_PERCENTILE;
-	unsigned int dbits;
-	u64 reduction = 0;
+	u64 reduction;
 
 	if (count_all)
 		outlier_percentile = 100;
@@ -175,17 +154,13 @@ static bool latency_model_update_small_buckets(
 		}
 	}
 
-	// If the calculated value deviates too much from the current model,
-	// readjust the model by halving the weights of acumulated values
-	dbits = deviation_bits(calculate_base(sum_latency, sum_count),
-		model->base, LM_ADJ_TOLERANCE_BASE);
-	
-	if (LM_ADJ_REDUCTION_RESIST > dbits)
-		reduction = LM_ADJ_REDUCTION_RESIST - dbits;
-
-	if (dbits && model->small_count >> reduction) {
-		model->small_sum_delay -= model->small_sum_delay >> reduction;
-		model->small_count     -= model->small_count     >> reduction;
+	// Shrink the model if it reaches at the threshold
+	if (model->small_count >= 1000000ULL * LM_SHRINK_AT_MREQ) {
+		reduction = LM_SHRINK_RESIST;
+		if (model->small_count >> reduction) {
+			model->small_sum_delay -= model->small_sum_delay >> reduction;
+			model->small_count     -= model->small_count     >> reduction;
+		}
 	}
 
 	// Accumulate the average latency into the statistics
@@ -214,8 +189,7 @@ static bool latency_model_update_large_buckets(
 	s64 sum_latency = 0;
 	u64 sum_block_size = 0, intercept;
 	u32 outlier_percentile = LM_OUTLIER_PERCENTILE;
-	unsigned int dbits;
-	u64 reduction = 0;
+	u64 reduction;
 
 	if (count_all)
 		outlier_percentile = 100;
@@ -250,23 +224,19 @@ static bool latency_model_update_large_buckets(
 		}
 	}
 
+	// Shrink the model if it reaches at the threshold
+	if (model->large_sum_bsize >= 0x40000000ULL * LM_SHRINK_AT_GBYTES) {
+		reduction = LM_SHRINK_RESIST;
+		if (model->large_sum_bsize >> reduction) {
+			model->large_sum_delay -= model->large_sum_delay >> reduction;
+			model->large_sum_bsize -= model->large_sum_bsize >> reduction;
+		}
+	}
+
 	// Accumulate the average delay into the statistics
 	intercept = model->base * threshold_count;
 	if (sum_latency > intercept)
 		sum_latency -= intercept;
-
-	// If the calculated value deviates too much from the current model,
-	// readjust the model by halving the weights of acumulated values
-	dbits = deviation_bits(calculate_slope(sum_latency, sum_block_size),
-		model->slope, LM_ADJ_TOLERANCE_SLOPE);
-	
-	if (LM_ADJ_REDUCTION_RESIST > dbits)
-		reduction = LM_ADJ_REDUCTION_RESIST - dbits;
-
-	if (dbits && model->large_sum_bsize >> reduction) {
-		model->large_sum_delay -= model->large_sum_delay >> reduction;
-		model->large_sum_bsize -= model->large_sum_bsize >> reduction;
-	}
 
 	model->large_sum_delay += sum_latency;
 	model->large_sum_bsize += sum_block_size;
