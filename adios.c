@@ -24,7 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.7.1"
+#define ADIOS_VERSION "0.7.6"
 
 static u64 global_latency_window = 16000000ULL;
 static int bq_refill_below_ratio = 15;
@@ -70,6 +70,9 @@ static unsigned int adios_batch_size_limit[ADIOS_NUM_OPTYPES] = {
 #define LM_INTERVAL_THRESHOLD   1500
 #define LM_OUTLIER_PERCENTILE     99
 #define LM_NUM_BUCKETS            64
+#define LM_ADJ_TOLERANCE_BASE      2
+#define LM_ADJ_TOLERANCE_SLOPE     1
+#define LM_ADJ_REDUCTION_RESIST    6
 
 struct latency_bucket {
 	u64 count;
@@ -83,7 +86,7 @@ struct latency_model {
 	u64 small_sum_delay;
 	u64 small_count;
 	u64 large_sum_delay;
-	u64 large_sum_block_size;
+	u64 large_sum_bsize;
 	u64 last_updated_jiffies;
 	spinlock_t lock;
 
@@ -92,18 +95,33 @@ struct latency_model {
 	spinlock_t buckets_lock;
 };
 
-static unsigned int latency_model_input_bucket_index(
-		struct latency_model *model, u64 measured, u64 predicted) {
-	unsigned int bucket_index;
-
-	if (measured < predicted * 2)
-		bucket_index = (measured * 20) / predicted;
-	else if (measured < predicted * 5)
-		bucket_index = (measured * 10) / predicted + 20;
-	else
-		bucket_index = (measured * 3) / predicted + 40;
+static u64 deviation_bits(u64 a, u64 b, unsigned int threshold) {
+	u64 deviation;
+	unsigned int dbits;
 	
-	return bucket_index;
+	if (a > b) swap(a, b);
+	if (a << threshold < b)
+		return 0;
+
+	if (a)
+		deviation = div_u64(b, a);
+	if (deviation <= 1)
+		return 0;
+
+	dbits = fls64(deviation);
+	if (dbits > threshold)
+		dbits -= threshold;
+
+	return dbits;
+}
+
+static inline u64 calculate_base(u64 sum_delay, u64 count) {
+	return !count ? 0 : div_u64(sum_delay, count);
+}
+
+static inline u64 calculate_slope(u64 sum_delay, u64 sum_block_size) {
+	return !sum_block_size ? 0 :
+		div_u64(sum_delay, DIV_ROUND_UP_ULL(sum_block_size, 1024));
 }
 
 static u32 latency_model_count_small_buckets(struct latency_model *model) {
@@ -121,6 +139,8 @@ static bool latency_model_update_small_buckets(
 	u32 outlier_threshold_bucket = 0;
 	u64 sum_latency = 0, sum_count = 0;
 	u32 outlier_percentile = LM_OUTLIER_PERCENTILE;
+	unsigned int dbits;
+	u64 reduction = 0;
 
 	if (count_all)
 		outlier_percentile = 100;
@@ -150,9 +170,22 @@ static bool latency_model_update_small_buckets(
 			if (bucket->count > 0) {
 				sum_latency +=
 					(bucket->sum_latency * remaining_count) / bucket->count;
+				sum_count += remaining_count;
 			}
-			sum_count += remaining_count;
 		}
+	}
+
+	// If the calculated value deviates too much from the current model,
+	// readjust the model by halving the weights of acumulated values
+	dbits = deviation_bits(calculate_base(sum_latency, sum_count),
+		model->base, LM_ADJ_TOLERANCE_BASE);
+	
+	if (LM_ADJ_REDUCTION_RESIST > dbits)
+		reduction = LM_ADJ_REDUCTION_RESIST - dbits;
+
+	if (dbits && model->small_count >> reduction) {
+		model->small_sum_delay -= model->small_sum_delay >> reduction;
+		model->small_count     -= model->small_count     >> reduction;
 	}
 
 	// Accumulate the average latency into the statistics
@@ -181,6 +214,8 @@ static bool latency_model_update_large_buckets(
 	s64 sum_latency = 0;
 	u64 sum_block_size = 0, intercept;
 	u32 outlier_percentile = LM_OUTLIER_PERCENTILE;
+	unsigned int dbits;
+	u64 reduction = 0;
 
 	if (count_all)
 		outlier_percentile = 100;
@@ -218,8 +253,23 @@ static bool latency_model_update_large_buckets(
 	// Accumulate the average delay into the statistics
 	intercept = model->base * threshold_count;
 	if (sum_latency > intercept)
-		model->large_sum_delay += sum_latency - intercept;
-	model->large_sum_block_size += sum_block_size;
+		sum_latency -= intercept;
+
+	// If the calculated value deviates too much from the current model,
+	// readjust the model by halving the weights of acumulated values
+	dbits = deviation_bits(calculate_slope(sum_latency, sum_block_size),
+		model->slope, LM_ADJ_TOLERANCE_SLOPE);
+	
+	if (LM_ADJ_REDUCTION_RESIST > dbits)
+		reduction = LM_ADJ_REDUCTION_RESIST - dbits;
+
+	if (dbits && model->large_sum_bsize >> reduction) {
+		model->large_sum_delay -= model->large_sum_delay >> reduction;
+		model->large_sum_bsize -= model->large_sum_bsize >> reduction;
+	}
+
+	model->large_sum_delay += sum_latency;
+	model->large_sum_bsize += sum_block_size;
 
 	// Reset large bucket information
 	memset(model->large_bucket, 0, sizeof(model->large_bucket[0]) * LM_NUM_BUCKETS);
@@ -261,18 +311,33 @@ static void latency_model_update(struct latency_model *model) {
 
 	// Update the base parameter if small bucket was processed
 	if (small_processed && model->small_count)
-		model->base = div_u64(model->small_sum_delay, model->small_count);
+		model->base = calculate_base(
+			model->small_sum_delay, model->small_count);
 
 	// Update the slope parameter if large bucket was processed
-	if (large_processed && model->large_sum_block_size)
-		model->slope = div_u64(model->large_sum_delay,
-			DIV_ROUND_UP_ULL(model->large_sum_block_size, 1024));
+	if (large_processed && model->large_sum_bsize)
+		model->slope = calculate_slope(
+			model->large_sum_delay, model->large_sum_bsize);
 
 	// Reset statistics and update last updated jiffies if time has elapsed
 	if (time_elapsed)
 		model->last_updated_jiffies = now;
 
 	spin_unlock_irqrestore(&model->lock, flags);
+}
+
+static unsigned int latency_model_input_bucket_index(
+		struct latency_model *model, u64 measured, u64 predicted) {
+	unsigned int bucket_index;
+
+	if (measured < predicted * 2)
+		bucket_index = (measured * 20) / predicted;
+	else if (measured < predicted * 5)
+		bucket_index = (measured * 10) / predicted + 20;
+	else
+		bucket_index = (measured * 3) / predicted + 40;
+	
+	return bucket_index;
 }
 
 static void latency_model_input(struct latency_model *model,
@@ -301,7 +366,7 @@ static void latency_model_input(struct latency_model *model,
 		}
 	} else {
 		// --- Handling for large requests ---
-		if (!model->base) {
+		if (!model->base || !predicted_latency) {
 			spin_unlock_irqrestore(&model->buckets_lock, flags);
 			return;
 		}
@@ -404,7 +469,7 @@ adios_add_rq_rb(struct adios_data *ad, struct request *rq) {
 		struct request *this = rb_entry_rq(*new);
 		struct adios_rq_data *td = rq_data(this);
 
-		s64 diff = td->deadline - rd->deadline;
+		u64 diff = td->deadline - rd->deadline;
 
 		parent = *new;
 		if (diff < 0)
@@ -937,7 +1002,7 @@ static ssize_t adios_lat_model_##name##_show(struct elevator_queue *e, char *pag
 	len += sprintf(page + len, "small: %llu ns / %llu rq\n", \
 		model->small_sum_delay, model->small_count);\
 	len += sprintf(page + len, "large: %llu ns / %llu B\n", \
-		model->large_sum_delay, model->large_sum_block_size);\
+		model->large_sum_delay, model->large_sum_bsize);\
 	spin_unlock_irqrestore(&model->lock, flags); \
 	return len;							\
 } \
@@ -1033,7 +1098,7 @@ static ssize_t adios_reset_latency_model_store(struct elevator_queue *e, const c
 		model->small_sum_delay = 0ULL;
 		model->small_count = 0ULL;
 		model->large_sum_delay = 0ULL;
-		model->large_sum_block_size = 0ULL;
+		model->large_sum_bsize = 0ULL;
 		spin_unlock_irqrestore(&model->lock, flags);
 	}
 
