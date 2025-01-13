@@ -24,7 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.7.7"
+#define ADIOS_VERSION "0.7.8"
 
 static u64 global_latency_window = 16000000ULL;
 static int bq_refill_below_ratio = 15;
@@ -380,7 +380,7 @@ struct io_stats {
 	uint32_t dispatched;
 	atomic_t completed;
 
-	uint32_t batch_size_actual_highest[ADIOS_NUM_OPTYPES];
+	uint32_t batch_size_actual_high[ADIOS_NUM_OPTYPES];
 };
 
 #define ADIOS_NUM_BQ_PAGES 2
@@ -579,8 +579,8 @@ static bool adios_fill_batch_queues(struct adios_data *ad, u64 *tpl) {
 	if (count) {
 		ad->more_bq_ready = true;
 		for (int optype = 0; optype < ADIOS_NUM_OPTYPES; optype++) {
-			if (ad->stats.batch_size_actual_highest[optype] < optype_count[optype])
-				ad->stats.batch_size_actual_highest[optype] = optype_count[optype];
+			if (ad->stats.batch_size_actual_high[optype] < optype_count[optype])
+				ad->stats.batch_size_actual_high[optype] = optype_count[optype];
 		}
 	}
 	return count;
@@ -968,11 +968,7 @@ static ssize_t adios_lat_model_##name##_show(struct elevator_queue *e, char *pag
 	unsigned long flags; \
 	spin_lock_irqsave(&model->lock, flags); \
 	len += sprintf(page,       "base : %llu ns\n", model->base);	\
-	len += sprintf(page + len, "slope: %llu ns / kB\n", model->slope);	\
-	len += sprintf(page + len, "small: %llu ns / %llu rq\n", \
-		model->small_sum_delay, model->small_count);\
-	len += sprintf(page + len, "large: %llu ns / %llu B\n", \
-		model->large_sum_delay, model->large_sum_bsize);\
+	len += sprintf(page + len, "slope: %llu ns/KiB\n", model->slope);	\
 	spin_unlock_irqrestore(&model->lock, flags); \
 	return len;							\
 } \
@@ -1016,21 +1012,19 @@ static ssize_t adios_batch_size_limit_##name##_show( \
 SYSFS_OPTYPE_DECL(read, ADIOS_READ);
 SYSFS_OPTYPE_DECL(write, ADIOS_WRITE);
 SYSFS_OPTYPE_DECL(discard, ADIOS_DISCARD);
-SYSFS_OPTYPE_DECL(other, ADIOS_OTHER);
 
-static ssize_t adios_batch_size_actual_highest_show(struct elevator_queue *e, char *page) {
+static ssize_t adios_batch_size_actual_high_show(struct elevator_queue *e, char *page) {
 	struct adios_data *ad = e->elevator_data;
-	unsigned int read_count, write_count, discard_count, other_count;
+	unsigned int read_count, write_count, discard_count;
 
 	guard(spinlock)(&ad->lock);
-	read_count = ad->stats.batch_size_actual_highest[ADIOS_READ];
-	write_count = ad->stats.batch_size_actual_highest[ADIOS_WRITE];
-	discard_count = ad->stats.batch_size_actual_highest[ADIOS_DISCARD];
-	other_count = ad->stats.batch_size_actual_highest[ADIOS_OTHER];
+	read_count = ad->stats.batch_size_actual_high[ADIOS_READ];
+	write_count = ad->stats.batch_size_actual_high[ADIOS_WRITE];
+	discard_count = ad->stats.batch_size_actual_high[ADIOS_DISCARD];
 
 	return sprintf(page,
-		"Read   : %u\nWrite  : %u\nDiscard: %u\nOther  : %u\n",
-		read_count, write_count, discard_count, other_count);
+		"Read   : %u\nWrite  : %u\nDiscard: %u\n",
+		read_count, write_count, discard_count);
 }
 
 static ssize_t adios_reset_bq_stats_store(struct elevator_queue *e, const char *page, size_t count) {
@@ -1044,7 +1038,7 @@ static ssize_t adios_reset_bq_stats_store(struct elevator_queue *e, const char *
 
 	guard(spinlock)(&ad->lock);
 	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++)
-		ad->stats.batch_size_actual_highest[i] = 0;
+		ad->stats.batch_size_actual_high[i] = 0;
 
 	return count;
 }
@@ -1128,24 +1122,21 @@ static ssize_t adios_version_show(struct elevator_queue *e, char *page)
 
 static struct elv_fs_entry adios_sched_attrs[] = {
 	DD_ATTR(adios_version, adios_version_show, NULL),
-	DD_ATTR_RO(batch_size_actual_highest),
+	DD_ATTR_RO(batch_size_actual_high),
 	DD_ATTR_RW(bq_refill_below_ratio),
 	DD_ATTR_RW(global_latency_window),
 
 	DD_ATTR_RW(batch_size_limit_read),
 	DD_ATTR_RW(batch_size_limit_write),
 	DD_ATTR_RW(batch_size_limit_discard),
-	DD_ATTR_RW(batch_size_limit_other),
 
 	DD_ATTR_RO(lat_model_read),
 	DD_ATTR_RO(lat_model_write),
 	DD_ATTR_RO(lat_model_discard),
-	DD_ATTR_RO(lat_model_other),
 
 	DD_ATTR_RW(lat_target_read),
 	DD_ATTR_RW(lat_target_write),
 	DD_ATTR_RW(lat_target_discard),
-	DD_ATTR_RW(lat_target_other),
 
 	DD_ATTR_WO(reset_bq_stats),
 	DD_ATTR_WO(reset_latency_model),
