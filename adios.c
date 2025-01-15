@@ -24,7 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.8.1"
+#define ADIOS_VERSION "0.8.3"
 
 // Global variable to control the latency
 static u64 global_latency_window = 16000000ULL;
@@ -457,7 +457,8 @@ static inline struct adios_rq_data *rq_data(struct request *rq) {
 static void
 adios_add_rq_rb(struct adios_data *ad, struct request *rq) {
 	struct rb_root_cached *root = &ad->dl_queue;
-	struct rb_node **new = &(root->rb_root.rb_node), *parent = NULL;
+	struct rb_node **link = &(root->rb_root.rb_node), *parent = NULL;
+	bool leftmost = true;
 	struct adios_rq_data *rd = rq_data(rq);
 	struct dl_list *dl_list;
 
@@ -468,15 +469,17 @@ adios_add_rq_rb(struct adios_data *ad, struct request *rq) {
 	rd->deadline =
 		rq->start_time_ns + adios_latency_targets[optype] + rd->predicted_latency;
 
-	while (*new) {
-		dl_list = rb_entry(*new, struct dl_list, node);
+	while (*link) {
+		dl_list = rb_entry(*link, struct dl_list, node);
 		s64 diff = rd->deadline - dl_list->deadline;
 
-		parent = *new;
-		if (diff < 0)
-			new = &((*new)->rb_left);
-		else
-			new = &((*new)->rb_right);
+		parent = *link;
+		if (diff <= 0) {
+			link = &((*link)->rb_left);
+		} else {
+			link = &((*link)->rb_right);
+			leftmost = false;
+		}
 	}
 
 	dl_list = rb_entry_safe(parent, struct dl_list, node);
@@ -486,8 +489,8 @@ adios_add_rq_rb(struct adios_data *ad, struct request *rq) {
 			return;
 		dl_list->deadline = rd->deadline;
 		INIT_LIST_HEAD(&dl_list->head);
-		rb_link_node(&dl_list->node, parent, new);
-		rb_insert_color_cached(&dl_list->node, root, false);
+		rb_link_node(&dl_list->node, parent, link);
+		rb_insert_color_cached(&dl_list->node, root, leftmost);
 	}
 
 	list_add_tail(&rd->dl_node, &dl_list->head);
@@ -561,11 +564,12 @@ static u32 adios_queued(struct adios_data *ad) {
 // Select the next request to dispatch from the deadline-sorted red-black tree
 static struct request *adios_next_request(struct adios_data *ad) {
 	struct rb_root_cached *root = &ad->dl_queue;
+	struct rb_node *first = rb_first_cached(root);
 
-	if (RB_EMPTY_ROOT(&root->rb_root))
+	if (!first)
 		return NULL;
 
-	struct dl_list *dl_list = rb_entry(rb_first(&root->rb_root), struct dl_list, node);
+	struct dl_list *dl_list = rb_entry(first, struct dl_list, node);
 	struct adios_rq_data *rd = list_first_entry(&dl_list->head, struct adios_rq_data, dl_node);
 
 	return rd->rq;
