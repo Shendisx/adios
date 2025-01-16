@@ -24,10 +24,10 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.8.3"
+#define ADIOS_VERSION "0.8.4"
 
 // Global variable to control the latency
-static u64 global_latency_window = 16000000ULL;
+static u64 global_latency_window = 60000000ULL;
 // Ratio below which batch queues should be refilled
 static int bq_refill_below_ratio = 15;
 
