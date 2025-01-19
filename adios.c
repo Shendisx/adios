@@ -24,7 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.9.3"
+#define ADIOS_VERSION "0.9.4"
 
 // Global variable to control the latency
 static u64 global_latency_window = 60000000ULL;
@@ -463,11 +463,13 @@ adios_add_rq_rb(struct adios_data *ad, struct request *rq) {
 		s64 diff = rd->deadline - dl_list->deadline;
 
 		parent = *link;
-		if (diff <= 0) {
+		if (diff < 0) {
 			link = &((*link)->rb_left);
-		} else {
+		} else if (diff > 0) {
 			link = &((*link)->rb_right);
 			leftmost = false;
+		} else { // diff == 0
+			goto found;
 		}
 	}
 
@@ -481,7 +483,7 @@ adios_add_rq_rb(struct adios_data *ad, struct request *rq) {
 		rb_link_node(&dl_list->node, parent, link);
 		rb_insert_color_cached(&dl_list->node, root, leftmost);
 	}
-
+found:
 	list_add_tail(&rd->dl_node, &dl_list->head);
 	rd->dl_list = &dl_list->head;
 }
@@ -588,7 +590,7 @@ static bool adios_fill_batch_queues(struct adios_data *ad, u64 lat) {
 		lat += rd->predicted_latency;
 
 		// Check batch size and total predicted latency
-		if (count && (!ad->latency_model[optype].base ||
+		if (count && (!ad->latency_model[optype].base || 
 			ad->batch_count[page][optype] >= adios_batch_size_limit[optype] ||
 			lat > global_latency_window)) {
 			break;
