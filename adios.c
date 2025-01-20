@@ -24,10 +24,10 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "0.9.4"
+#define ADIOS_VERSION "0.9.5"
 
 // Global variable to control the latency
-static u64 global_latency_window = 60000000ULL;
+static u64 global_latency_window = 4000000ULL;
 // Ratio below which batch queues should be refilled
 static int bq_refill_below_ratio = 15;
 
@@ -65,8 +65,8 @@ static u64 adios_latency_targets[ADIOS_NUM_OPTYPES] = {
 
 // Maximum batch size limits for each operation type
 static unsigned int adios_batch_size_limit[ADIOS_NUM_OPTYPES] = {
-	[ADIOS_READ]    = 64,
-	[ADIOS_WRITE]   = 32,
+	[ADIOS_READ]    = 16,
+	[ADIOS_WRITE]   =  8,
 	[ADIOS_DISCARD] =  1,
 	[ADIOS_OTHER]   =  1,
 };
