@@ -24,7 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "1.5.0"
+#define ADIOS_VERSION "1.5.1"
 
 // Define operation types supported by ADIOS
 enum adios_op_type {
@@ -154,7 +154,7 @@ struct adios_rq_data {
 	u32 block_size;
 } __attribute__((aligned(64)));
 
-const int sched_prio_to_weight[40] = {
+const static int adios_prio_to_weight[40] = {
  /* -20 */     88761,     71755,     56483,     46273,     36291,
  /* -15 */     29154,     23254,     18705,     14949,     11916,
  /* -10 */      9548,      7620,      6100,      4904,      3906,
@@ -723,7 +723,7 @@ static struct request *next_request(struct adios_data *ad) {
 			ad->dl_bias = sign;
 		else {
 			ad->dl_bias += sign * (s64)((rd->pred_lat *
-				sched_prio_to_weight[ad->dl_prio[bias_idx] + 20]) >> 10);
+				adios_prio_to_weight[ad->dl_prio[bias_idx] + 20]) >> 10);
 		}
 	}
 
