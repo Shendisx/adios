@@ -24,12 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "1.0.0"
-
-// Global variable to control the latency
-static u64 global_latency_window = 16000000ULL;
-// Ratio below which batch queues should be refilled
-static u8  bq_refill_below_ratio = 15;
+#define ADIOS_VERSION "1.1.0"
 
 // Define operation types supported by ADIOS
 enum adios_op_type {
@@ -39,6 +34,11 @@ enum adios_op_type {
 	ADIOS_OTHER   = 3,
 	ADIOS_OPTYPES = 4,
 };
+
+// Global variable to control the latency
+static u64 default_global_latency_window = 16000000ULL;
+// Ratio below which batch queues should be refilled
+static u8  default_bq_refill_below_ratio = 15;
 
 // Latency targets for each operation type
 static u64 default_latency_target[ADIOS_OPTYPES] = {
@@ -105,11 +105,13 @@ struct adios_data {
 	struct rb_root_cached dl_tree;
 	spinlock_t lock;
 
+	u64 global_latency_window;
 	u64 latency_target[ADIOS_OPTYPES];
 	u32 batch_limit[ADIOS_OPTYPES];
 	u32 batch_actual_max_size[ADIOS_OPTYPES];
 	u32 batch_actual_max_total;
 	u32 async_depth;
+	u8  bq_refill_below_ratio;
 
 	u8 bq_page;
 	bool more_bq_ready;
@@ -701,7 +703,7 @@ static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
 		// Check batch size and total predicted latency
 		if (count && (!ad->latency_model[optype].base || 
 			ad->batch_count[page][optype] >= ad->batch_limit[optype] ||
-			current_lat > global_latency_window)) {
+			current_lat > ad->global_latency_window)) {
 			break;
 		}
 
@@ -744,7 +746,7 @@ static struct request *dispatch_from_bq(struct adios_data *ad) {
 	tpl = atomic64_read(&ad->total_pred_lat);
 
 	if (!ad->more_bq_ready && (!tpl ||
-			tpl < global_latency_window * bq_refill_below_ratio / 100))
+			tpl < ad->global_latency_window * ad->bq_refill_below_ratio / 100))
 		fill_batch_queues(ad, tpl);
 
 again:
@@ -895,6 +897,9 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	}
 
 	eq->elevator_data = ad;
+	
+	ad->global_latency_window = default_global_latency_window;
+	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
 
 	INIT_LIST_HEAD(&ad->prio_queue);
 	ad->dl_tree = RB_ROOT_CACHED;
@@ -1020,6 +1025,7 @@ static ssize_t adios_batch_actual_max_show(
 // Set the global latency window
 static ssize_t adios_global_latency_window_store(
 		struct elevator_queue *e, const char *page, size_t count) {
+	struct adios_data *ad = e->elevator_data;
 	unsigned long nsec;
 	int ret;
 
@@ -1027,7 +1033,7 @@ static ssize_t adios_global_latency_window_store(
 	if (ret)
 		return ret;
 
-	global_latency_window = nsec;
+	ad->global_latency_window = nsec;
 
 	return count;
 }
@@ -1035,18 +1041,21 @@ static ssize_t adios_global_latency_window_store(
 // Show the global latency window
 static ssize_t adios_global_latency_window_show(
 		struct elevator_queue *e, char *page) {
-	return sprintf(page, "%llu\n", global_latency_window);
+	struct adios_data *ad = e->elevator_data;
+	return sprintf(page, "%llu\n", ad->global_latency_window);
 }
 
 // Show the bq_refill_below_ratio
 static ssize_t adios_bq_refill_below_ratio_show(
 		struct elevator_queue *e, char *page) {
-	return sprintf(page, "%d\n", bq_refill_below_ratio);
+	struct adios_data *ad = e->elevator_data;
+	return sprintf(page, "%d\n", ad->bq_refill_below_ratio);
 }
 
 // Set the bq_refill_below_ratio
 static ssize_t adios_bq_refill_below_ratio_store(
 		struct elevator_queue *e, const char *page, size_t count) {
+	struct adios_data *ad = e->elevator_data;
 	int ratio;
 	int ret;
 
@@ -1054,7 +1063,7 @@ static ssize_t adios_bq_refill_below_ratio_store(
 	if (ret || ratio < 0 || ratio > 100)
 		return -EINVAL;
 
-	bq_refill_below_ratio = ratio;
+	ad->bq_refill_below_ratio = ratio;
 
 	return count;
 }
