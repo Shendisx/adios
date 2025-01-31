@@ -24,7 +24,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "1.5.1"
+#define ADIOS_VERSION "1.5.2"
 
 // Define operation types supported by ADIOS
 enum adios_op_type {
@@ -50,8 +50,8 @@ static u64 default_latency_target[ADIOS_OPTYPES] = {
 
 // Maximum batch size limits for each operation type
 static u32 default_batch_limit[ADIOS_OPTYPES] = {
-	[ADIOS_READ]    = 16,
-	[ADIOS_WRITE]   =  8,
+	[ADIOS_READ]    = 24,
+	[ADIOS_WRITE]   = 48,
 	[ADIOS_DISCARD] =  1,
 	[ADIOS_OTHER]   =  1,
 };
@@ -154,7 +154,7 @@ struct adios_rq_data {
 	u32 block_size;
 } __attribute__((aligned(64)));
 
-const static int adios_prio_to_weight[40] = {
+static const int adios_prio_to_weight[40] = {
  /* -20 */     88761,     71755,     56483,     46273,     36291,
  /* -15 */     29154,     23254,     18705,     14949,     11916,
  /* -10 */      9548,      7620,      6100,      4904,      3906,
