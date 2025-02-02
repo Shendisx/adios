@@ -17,6 +17,7 @@
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/timekeeping.h>
 
 #include "include/elevator.h"
@@ -24,7 +25,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "1.5.2"
+#define ADIOS_VERSION "1.5.2R"
 
 // Define operation types supported by ADIOS
 enum adios_op_type {
@@ -35,10 +36,17 @@ enum adios_op_type {
 	ADIOS_OPTYPES = 4,
 };
 
-// Global variable to control the latency
-static u64 default_global_latency_window = 16000000ULL;
-// Ratio below which batch queues should be refilled
-static u8  default_bq_refill_below_ratio = 15;
+// Global variable to control the latency (Non-Rotational)
+static u64 default_global_latency_window_nr = 16000000ULL;
+// Ratio below which batch queues should be refilled (Non-Rotational)
+static u8  default_bq_refill_below_ratio_nr = 15;
+
+// Global variable to control the latency (Rotational)
+static u64 default_global_latency_window_r  = 64000000ULL;
+// Ratio below which batch queues should be refilled (Rotational)
+static u8  default_bq_refill_below_ratio_r  = 0;
+
+static u32 default_near_threshold           = 1;
 
 // Latency targets for each operation type
 static u64 default_latency_target[ADIOS_OPTYPES] = {
@@ -104,6 +112,8 @@ struct latency_model {
 
 // Adios scheduler data
 struct adios_data {
+	struct request_queue *queue;
+
 	spinlock_t pq_lock;
 	struct list_head prio_queue;
 
@@ -131,6 +141,14 @@ struct adios_data {
 	struct timer_list update_timer;
 
 	atomic64_t total_pred_lat;
+
+	// Rotational device specific variables
+	bool is_rotational;
+	bool use_rotational;  // New variable to control rotational behavior via sysfs
+	u32 near_threshold;  // Percentage of total blocks
+	u64 near_threshold_bytes;
+	u64 head_pos;
+	void **pos_array;    // Array for sorting requests
 
 	struct kmem_cache *rq_data_pool;
 	struct kmem_cache *dl_group_pool;
@@ -164,6 +182,16 @@ static const int adios_prio_to_weight[40] = {
  /*  10 */       110,        87,        70,        56,        45,
  /*  15 */        36,        29,        23,        18,        15,
 };
+
+// Comparison function for sorting requests by block address
+static int cmp_req_by_block_address(const void *a, const void *b) {
+	const struct request *rq_a = *(const struct request **)a;
+	const struct request *rq_b = *(const struct request **)b;
+	u64 pos_a = blk_rq_pos(rq_a);
+	u64 pos_b = blk_rq_pos(rq_b);
+
+	return (int)(pos_a > pos_b) - (int)(pos_a < pos_b);
+}
 
 // Count the number of entries in small buckets
 static u32 lm_count_small_entries(struct latency_model *model) {
@@ -752,12 +780,14 @@ static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
 	u32 optype_count[ADIOS_OPTYPES];
 	memset(optype_count, 0, sizeof(optype_count));
 	u8 page = (ad->bq_page + 1) % ADIOS_BQ_PAGES;
+	struct request *rq;
+	u64 last_rq_end_pos = 0;
 
 	reset_batch_counts(ad, page);
 
 	spin_lock_irqsave(&ad->lock, flags);
 	while (true) {
-		struct request *rq = next_request(ad);
+		rq = next_request(ad);
 		if (!rq)
 			break;
 
@@ -766,7 +796,7 @@ static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
 		current_lat += rd->pred_lat;
 
 		// Check batch size and total predicted latency
-		if (count && (!ad->latency_model[optype].base || 
+		if (count && (!ad->latency_model[optype].base ||
 			ad->batch_count[page][optype] >= ad->batch_limit[optype] ||
 			current_lat > ad->global_latency_window)) {
 			break;
@@ -775,12 +805,42 @@ static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
 		remove_request(ad, rq);
 
 		// Add request to the corresponding batch queue
-		list_add_tail(&rq->queuelist, &ad->batch_queue[page][optype]);
+		if (ad->use_rotational)
+			ad->pos_array[count] = rq;
+		else
+			list_add_tail(&rq->queuelist, &ad->batch_queue[page][optype]);
+
 		ad->batch_count[page][optype]++;
 		atomic64_add(rd->pred_lat, &ad->total_pred_lat);
 		optype_count[optype]++;
 		count++;
 	}
+
+	if (ad->use_rotational) {
+		// Sort requests by block address
+		sort(ad->pos_array, count, sizeof(void *), cmp_req_by_block_address, NULL);
+
+		u64 threshold_pos =
+			(ad->head_pos < ad->near_threshold_bytes)? 0:
+			 ad->head_pos - ad->near_threshold_bytes;
+
+		// Classify requests into regions and add to batch queues
+		u32 idx;
+		u64 pos;
+		for (idx = 0; idx < count && (pos = blk_rq_pos(rq = ad->pos_array[idx])) < threshold_pos; idx++) {
+			list_add_tail(&rq->queuelist, &ad->batch_queue[page][1]);
+			last_rq_end_pos = pos + blk_rq_bytes(rq);
+		}
+		for (; idx < count; idx++) {
+			rq = ad->pos_array[idx];
+			list_add_tail(&rq->queuelist, &ad->batch_queue[page][0]);
+			last_rq_end_pos = blk_rq_pos(rq) + blk_rq_bytes(rq);
+		}
+
+		// Update head_pos after processing the batch
+		ad->head_pos = last_rq_end_pos;
+	}
+
 	spin_unlock_irqrestore(&ad->lock, flags);
 
 	if (count) {
@@ -818,8 +878,8 @@ again:
 	// Check if there are any requests in the batch queues
 	for (u8 i = 0; i < ADIOS_OPTYPES; i++) {
 		if (!list_empty(&ad->batch_queue[ad->bq_page][i])) {
-			rq = list_first_entry(&ad->batch_queue[ad->bq_page][i],
-									struct request, queuelist);
+			rq = list_first_entry(
+				&ad->batch_queue[ad->bq_page][i], struct request, queuelist);
 			list_del_init(&rq->queuelist);
 			return rq;
 		}
@@ -923,6 +983,27 @@ static bool adios_has_work(struct blk_mq_hw_ctx *hctx) {
 	return pq_has_work(ad) || bq_has_work(ad) || dl_tree_has_work(ad);
 }
 
+static bool update_max_batch_size(struct adios_data *ad) {
+	// Allocate pos_array based on the maximum possible batch size
+	u32 max_batch_size = 0;
+	for (u8 i = 0; i < ADIOS_OPTYPES; i++)
+		max_batch_size += ad->batch_limit[i];
+	if (ad->pos_array)
+		kfree(ad->pos_array);
+	ad->pos_array = kmalloc_array(max_batch_size, sizeof(void *), GFP_KERNEL);
+	if (!ad->pos_array) {
+		pr_err("adios: Failed to allocate pos_array\n");
+		return false;
+	}
+	return true;
+}
+
+static void update_near_threshold_bytes(struct adios_data *ad) {
+	ad->near_threshold_bytes =
+		(u64)ad->queue->limits.max_sectors * ad->near_threshold / 1000 *
+			ad->queue->limits.physical_block_size;
+}
+
 // Initialize the scheduler-specific data for a hardware queue
 static int adios_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx) {
 	adios_depth_updated(hctx);
@@ -943,6 +1024,8 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	if (!ad)
 		goto put_eq;
 
+	ad->queue = q;
+	
 	// Create a memory pool for adios_rq_data
 	ad->rq_data_pool = kmem_cache_create("rq_data_pool",
 						sizeof(struct adios_rq_data),
@@ -963,9 +1046,6 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 
 	eq->elevator_data = ad;
 	
-	ad->global_latency_window = default_global_latency_window;
-	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
-
 	INIT_LIST_HEAD(&ad->prio_queue);
 	for (u8 i = 0; i < 2; i++)
 		ad->dl_tree[i] = RB_ROOT_CACHED;
@@ -994,12 +1074,38 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 	spin_lock_init(&ad->pq_lock);
 	spin_lock_init(&ad->bq_lock);
 
+	// Initialize rotational-specific variables
+	ad->near_threshold = 0;
+	ad->near_threshold_bytes = 0;
+	ad->head_pos = 0;
+	// Check if the device is rotational
+	ad->is_rotational = q->limits.features & BLK_FEAT_ROTATIONAL;
+	// Copy initial value of is_rotational to use_rotational
+	ad->use_rotational = ad->is_rotational;
+
+	if (ad->use_rotational) {
+		// Allocate pos_array based on the maximum possible batch size
+		if (!update_max_batch_size(ad)) {
+			pr_err("adios: Failed to allocate pos_array\n");
+			goto destroy_dl_group_pool;
+		}
+		ad->global_latency_window = default_global_latency_window_r;
+		ad->bq_refill_below_ratio = default_bq_refill_below_ratio_r;
+	} else {
+		ad->global_latency_window = default_global_latency_window_nr;
+		ad->bq_refill_below_ratio = default_bq_refill_below_ratio_nr;
+	}
+	ad->near_threshold        = default_near_threshold;
+	update_near_threshold_bytes(ad);
+
 	/* We dispatch from request queue wide instead of hw queue */
 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
 
 	q->elevator = eq;
 	return 0;
 
+destroy_dl_group_pool:
+	kmem_cache_destroy(ad->dl_group_pool);
 destroy_rq_data_pool:
 	kmem_cache_destroy(ad->rq_data_pool);
 free_ad:
@@ -1016,6 +1122,9 @@ static void adios_exit_sched(struct elevator_queue *e) {
 	timer_shutdown_sync(&ad->update_timer);
 
 	WARN_ON_ONCE(!list_empty(&ad->prio_queue));
+
+	if (ad->use_rotational)
+		kfree(ad->pos_array);
 
 	if (ad->rq_data_pool)
 		kmem_cache_destroy(ad->rq_data_pool);
@@ -1064,6 +1173,11 @@ static ssize_t adios_batch_limit_##name##_store(			\
 		return -EINVAL;						\
 	struct adios_data *ad = e->elevator_data;				\
 	ad->batch_limit[optype] = max_batch;				\
+	if (ad->use_rotational) {                                \
+		guard(spinlock_irqsave)(&ad->lock);                 \
+		if (!update_max_batch_size(ad))                     \
+			return -ENOMEM;                                 \
+	}                                                       \
 	return count;							\
 }									\
 static ssize_t adios_batch_limit_##name##_show(				\
@@ -1163,6 +1277,29 @@ static ssize_t adios_read_priority_store(
 	return count;
 }
 
+// Show near_threshold for rotational devices
+static ssize_t adios_near_threshold_show(struct elevator_queue *e, char *page) {
+	struct adios_data *ad = e->elevator_data;
+	return sprintf(page, "%u\n", ad->near_threshold);
+}
+
+// Set near_threshold for rotational devices
+static ssize_t adios_near_threshold_store(struct elevator_queue *e, const char *page, size_t count) {
+	struct adios_data *ad = e->elevator_data;
+	unsigned long threshold;
+	int ret;
+
+	ret = kstrtoul(page, 10, &threshold);
+	if (ret || threshold > 1000)
+		return -EINVAL;
+
+	ad->near_threshold = threshold;
+	// Calculate near_threshold_bytes based on total sectors
+	update_near_threshold_bytes(ad);
+
+	return count;
+}
+
 // Reset batch queue statistics
 static ssize_t adios_reset_bq_stats_store(
 		struct elevator_queue *e, const char *page, size_t count) {
@@ -1214,6 +1351,40 @@ static ssize_t adios_version_show(struct elevator_queue *e, char *page) {
 	return sprintf(page, "%s\n", ADIOS_VERSION);
 }
 
+// New sysfs attribute for use_rotational
+static ssize_t adios_use_rotational_store(
+		struct elevator_queue *e, const char *page, size_t count) {
+	struct adios_data *ad = e->elevator_data;
+	unsigned long val;
+	int ret;
+
+	ret = kstrtoul(page, 10, &val);
+	if (ret || (val != 0 && val != 1))
+		return -EINVAL;
+
+	if (!ad->is_rotational && val == 1)
+		return -EPERM;
+
+	guard(spinlock_irqsave)(&ad->lock);
+
+	ad->use_rotational = !!val;
+	if (!ad->use_rotational) {
+		kfree(ad->pos_array);
+		ad->pos_array = NULL;
+	} else if (!update_max_batch_size(ad)) {
+		pr_err("adios: Failed to allocate pos_array\n");
+		return -ENOMEM;
+	}
+
+	return count;
+}
+
+static ssize_t adios_use_rotational_show(
+		struct elevator_queue *e, char *page) {
+	struct adios_data *ad = e->elevator_data;
+	return sprintf(page, "%d\n", ad->use_rotational);
+}
+
 // Define sysfs attributes
 #define AD_ATTR(name, show_func, store_func) \
 	__ATTR(name, 0644, show_func, store_func)
@@ -1242,11 +1413,15 @@ static struct elv_fs_entry adios_sched_attrs[] = {
 	AD_ATTR_RW(lat_target_write),
 	AD_ATTR_RW(lat_target_discard),
 
-    AD_ATTR_RW(read_priority),
+	AD_ATTR_RW(read_priority),
+
+	AD_ATTR_RW(near_threshold),
 
 	AD_ATTR_WO(reset_bq_stats),
 	AD_ATTR_WO(reset_lat_model),
 	AD_ATTR(adios_version, adios_version_show, NULL),
+
+	AD_ATTR_RW(use_rotational),  // New sysfs attribute for use_rotational
 
 	__ATTR_NULL
 };
