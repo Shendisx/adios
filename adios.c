@@ -17,7 +17,7 @@
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
 #include <linux/slab.h>
-#include <linux/sort.h>
+#include <linux/list_sort.h>
 #include <linux/timekeeping.h>
 
 #include "include/elevator.h"
@@ -25,7 +25,7 @@
 #include "include/blk-mq.h"
 #include "include/blk-mq-sched.h"
 
-#define ADIOS_VERSION "1.5.2R2"
+#define ADIOS_VERSION "1.5.2R3"
 
 // Define operation types supported by ADIOS
 enum adios_op_type {
@@ -38,7 +38,7 @@ enum adios_op_type {
 
 // Global variable to control the latency
 static u64 default_global_latency_window_nr = 16000000ULL;
-static u64 default_global_latency_window_r  = 72000000ULL;
+static u64 default_global_latency_window_r  = 64000000ULL;
 // Ratio below which batch queues should be refilled
 static u8  default_bq_refill_below_ratio = 15;
 
@@ -59,7 +59,7 @@ static u32 default_batch_limit[ADIOS_OPTYPES] = {
 };
 
 static u32 default_dl_prio[2] = {
-	[0] = 5,
+	[0] = 7,
 	[1] = 0,
 };
 
@@ -123,6 +123,8 @@ struct adios_data {
 	u32 async_depth;
 	u8  bq_refill_below_ratio;
 
+	bool optimize_spatial;
+
 	u8 bq_page;
 	bool more_bq_ready;
 	struct list_head batch_queue[ADIOS_BQ_PAGES][ADIOS_OPTYPES];
@@ -133,10 +135,6 @@ struct adios_data {
 	struct timer_list update_timer;
 
 	atomic64_t total_pred_lat;
-
-	// Variables related to spatial reordering
-	bool optimize_spatial;
-	void **pos_array;
 
 	struct kmem_cache *rq_data_pool;
 	struct kmem_cache *dl_group_pool;
@@ -172,9 +170,10 @@ static const int adios_prio_to_weight[40] = {
 };
 
 // Comparison function for sorting requests by block address
-static int cmp_rq_pos(const void *a, const void *b) {
-	const struct request *rq_a = *(const struct request **)a;
-	const struct request *rq_b = *(const struct request **)b;
+static int cmp_rq_pos(void *priv,
+		const struct list_head *a, const struct list_head *b) {
+	struct request *rq_a = list_entry(a, struct request, queuelist);
+	struct request *rq_b = list_entry(b, struct request, queuelist);
 	u64 pos_a = blk_rq_pos(rq_a);
 	u64 pos_b = blk_rq_pos(rq_b);
 
@@ -764,17 +763,16 @@ static void init_batch_queues(struct adios_data *ad) {
 // Fill the batch queues with requests from the deadline-sorted red-black tree
 static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
 	unsigned long flags;
-	u32 count = 0, write_count = 0;
+	u32 count = 0;
 	u32 optype_count[ADIOS_OPTYPES];
 	memset(optype_count, 0, sizeof(optype_count));
 	u8 page = (ad->bq_page + 1) % ADIOS_BQ_PAGES;
-	struct request *rq;
 
 	reset_batch_counts(ad, page);
 
 	spin_lock_irqsave(&ad->lock, flags);
 	while (true) {
-		rq = next_request(ad);
+		struct request *rq = next_request(ad);
 		if (!rq)
 			break;
 
@@ -792,11 +790,7 @@ static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
 		remove_request(ad, rq);
 
 		// Add request to the corresponding batch queue
-		if (optype == ADIOS_WRITE)
-			ad->pos_array[write_count++] = rq;
-		else
-			list_add_tail(&rq->queuelist, &ad->batch_queue[page][optype]);
-
+		list_add_tail(&rq->queuelist, &ad->batch_queue[page][optype]);
 		ad->batch_count[page][optype]++;
 		atomic64_add(rd->pred_lat, &ad->total_pred_lat);
 		optype_count[optype]++;
@@ -804,13 +798,10 @@ static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
 	}
 
 	// Sort write requests by block address
-	if (ad->optimize_spatial && write_count > 1)
-		sort(ad->pos_array, write_count, sizeof(void *), cmp_rq_pos, NULL);
-
-	for (u32 idx = 0; idx < write_count; idx++) {
-		rq = ad->pos_array[idx];
-		list_add_tail(&rq->queuelist, &ad->batch_queue[page][ADIOS_WRITE]);
-	}
+	if (ad->optimize_spatial)
+		for (u8 optype = ADIOS_WRITE; optype < ADIOS_OPTYPES; optype++)
+			if (ad->batch_count[page][optype] > 1)
+				list_sort(NULL, &ad->batch_queue[page][optype], cmp_rq_pos);
 
 	spin_unlock_irqrestore(&ad->lock, flags);
 
@@ -954,19 +945,6 @@ static bool adios_has_work(struct blk_mq_hw_ctx *hctx) {
 	return pq_has_work(ad) || bq_has_work(ad) || dl_tree_has_work(ad);
 }
 
-static bool init_pos_array(struct adios_data *ad) {
-	// Allocate pos_array based on the maximum possible batch size
-	u32 new_array_size = max(1U, ad->batch_limit[ADIOS_WRITE]);
-	if (ad->pos_array)
-		kfree(ad->pos_array);
-	ad->pos_array = kmalloc_array(new_array_size, sizeof(void *), GFP_KERNEL);
-	if (!ad->pos_array) {
-		pr_err("adios: Failed to allocate pos_array\n");
-		return false;
-	}
-	return true;
-}
-
 // Initialize the scheduler-specific data for a hardware queue
 static int adios_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx) {
 	adios_depth_updated(hctx);
@@ -1044,17 +1022,12 @@ static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 		default_global_latency_window_nr;
 	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
 
-	if (!init_pos_array(ad))
-		goto destroy_dl_group_pool;
-
 	/* We dispatch from request queue wide instead of hw queue */
 	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
 
 	q->elevator = eq;
 	return 0;
 
-destroy_dl_group_pool:
-	kmem_cache_destroy(ad->dl_group_pool);
 destroy_rq_data_pool:
 	kmem_cache_destroy(ad->rq_data_pool);
 free_ad:
@@ -1071,8 +1044,6 @@ static void adios_exit_sched(struct elevator_queue *e) {
 	timer_shutdown_sync(&ad->update_timer);
 
 	WARN_ON_ONCE(!list_empty(&ad->prio_queue));
-
-	kfree(ad->pos_array);
 
 	if (ad->rq_data_pool)
 		kmem_cache_destroy(ad->rq_data_pool);
@@ -1120,13 +1091,7 @@ static ssize_t adios_batch_limit_##name##_store(			\
 	if (ret || max_batch == 0)					\
 		return -EINVAL;						\
 	struct adios_data *ad = e->elevator_data;				\
-	guard(spinlock_irqsave)(&ad->lock);                 \
-	u32 prev_batch_limit = ad->batch_limit[optype];     \
 	ad->batch_limit[optype] = max_batch;				\
-	if (optype == ADIOS_WRITE && max_batch != prev_batch_limit) { \
-		if (!init_pos_array(ad))                        \
-			return -ENOMEM;                             \
-	}                                                   \
 	return count;							\
 }									\
 static ssize_t adios_batch_limit_##name##_show(				\
